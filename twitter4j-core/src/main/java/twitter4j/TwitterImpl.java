@@ -23,10 +23,8 @@ import twitter4j.conf.Configuration;
 
 import java.io.*;
 import java.net.URLEncoder;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
-import java.util.Map;
+import java.security.InvalidParameterException;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
 import static twitter4j.HttpParameter.getParameterArray;
@@ -40,9 +38,16 @@ import static twitter4j.HttpParameter.getParameterArray;
  */
 class TwitterImpl extends TwitterBaseImpl implements Twitter {
     private static final long serialVersionUID = 9170943084096085770L;
+    private static final int MB = 1024 * 1024; //1 MByte
+    private static final int MAX_VIDEO_SIZE = 15 * MB; //15MB is a constraint imposed by Twitter for video files
+    private static final int MAX_CHUNK_SIZE = 5 * MB; //max chunk size
     private final String IMPLICIT_PARAMS_STR;
     private final HttpParameter[] IMPLICIT_PARAMS;
     private final HttpParameter INCLUDE_MY_RETWEET;
+
+    private static final String CHUNKED_INIT = "INIT";
+    private static final String CHUNKED_APPEND = "APPEND";
+    private static final String CHUNKED_FINALIZE = "FINALIZE";
 
     private static final ConcurrentHashMap<Configuration, HttpParameter[]> implicitParamsMap = new ConcurrentHashMap<Configuration, HttpParameter[]>();
     private static final ConcurrentHashMap<Configuration, String> implicitParamsStrMap = new ConcurrentHashMap<Configuration, String>();
@@ -73,9 +78,6 @@ class TwitterImpl extends TwitterBaseImpl implements Twitter {
             }
             if (conf.isTrimUserEnabled()) {
                 params.add(new HttpParameter("trim_user", "1"));
-            }
-            if (conf.isIncludeExtAltTextEnabled()) {
-                params.add(new HttpParameter("include_ext_alt_text", "true"));
             }
             HttpParameter[] implicitParams = params.toArray(new HttpParameter[params.size()]);
 
@@ -237,16 +239,71 @@ class TwitterImpl extends TwitterBaseImpl implements Twitter {
     @Override
     public UploadedMedia uploadMedia(File image) throws TwitterException {
         checkFileValidity(image);
-        return new UploadedMedia(post(conf.getUploadBaseURL() + "media/upload.json"
-                , new HttpParameter("media", image)).asJSONObject());
+        return new UploadedMedia(post(conf.getUploadBaseURL() + "media/upload.json",
+                new HttpParameter("media", image)).asJSONObject());
     }
 
     @Override
     public UploadedMedia uploadMedia(String fileName, InputStream image) throws TwitterException {
-        return new UploadedMedia(post(conf.getUploadBaseURL() + "media/upload.json"
-                , new HttpParameter("media", fileName, image)).asJSONObject());
+        return new UploadedMedia(post(conf.getUploadBaseURL() + "media/upload.json",
+                new HttpParameter("media", fileName, image)).asJSONObject());
     }
 
+    @Override
+    public UploadedMedia uploadVideo(File video) throws TwitterException, IOException {
+        if (video == null) {
+            throw new InvalidParameterException("video file can't be null");
+        }
+        if (!video.exists()) {
+            throw new FileNotFoundException(video.getAbsolutePath());
+        }
+        long size = video.length();
+        return uploadVideo(video.getName(), size, new FileInputStream(video));
+    }
+
+    @Override
+    public UploadedMedia uploadVideo(String fileName, long size, InputStream media) throws TwitterException, IOException {
+        if (size > MAX_VIDEO_SIZE) {
+            throw new InvalidParameterException(
+                    String.format(Locale.US, "video file can't be longer than: %d MBytes", MAX_VIDEO_SIZE / MB));
+        }
+        UploadedMedia uploadedMedia = uploadMediaChunkedInit(size);
+        ChunkedInputStream inputStream = new ChunkedInputStream(media, MAX_CHUNK_SIZE);
+        try {
+            while (inputStream.nextSegment()) {
+                uploadMediaChunkedAppend(fileName, inputStream, uploadedMedia.getMediaId());
+            }
+            return uploadMediaChunkedFinalize(uploadedMedia.getMediaId());
+        } finally {
+            inputStream.finish();
+            inputStream.close();
+        }
+    }
+
+    private UploadedMedia uploadMediaChunkedInit(long size) throws TwitterException {
+        return new UploadedMedia(post(
+                conf.getUploadBaseURL() + "media/upload.json",
+                new HttpParameter("command", CHUNKED_INIT),
+                new HttpParameter("media_type", "video/mp4"),
+                new HttpParameter("total_bytes", size))
+                .asJSONObject());
+    }
+
+    private HttpResponse uploadMediaChunkedAppend(String fileName, ChunkedInputStream inputStream, long mediaId) throws TwitterException {
+        return post(conf.getUploadBaseURL() + "media/upload.json",
+                new HttpParameter("command", CHUNKED_APPEND),
+                new HttpParameter("media_id", mediaId),
+                new HttpParameter("segment_index", inputStream.getSegmentIndex()),
+                new HttpParameter("media", fileName, inputStream));
+    }
+
+    private UploadedMedia uploadMediaChunkedFinalize(long mediaId) throws TwitterException {
+        return new UploadedMedia(
+                post(conf.getUploadBaseURL() + "media/upload.json",
+                        new HttpParameter("command", CHUNKED_FINALIZE),
+                        new HttpParameter("media_id", mediaId)).asJSONObject());
+    }
+    
     /* Search Resources */
 
     @Override
@@ -578,10 +635,9 @@ class TwitterImpl extends TwitterBaseImpl implements Twitter {
 
     @Override
     public User verifyCredentials() throws TwitterException {
-        return super.fillInIDAndScreenName(
-                new HttpParameter[]{new HttpParameter("include_email", conf.isIncludeEmailEnabled())});
+        return super.fillInIDAndScreenName();
     }
-    
+
     @Override
     public AccountSettings updateAccountSettings(Integer trend_locationWoeid,
                                                  Boolean sleep_timeEnabled, String start_sleepTime,
@@ -646,7 +702,21 @@ class TwitterImpl extends TwitterBaseImpl implements Twitter {
             String profileSidebarFillColor,
             String profileSidebarBorderColor)
             throws TwitterException {
-        throw new UnsupportedOperationException("this API is no longer supported. https://twittercommunity.com/t/deprecation-of-account-update-profile-colors/28692");
+        List<HttpParameter> colors = new ArrayList<HttpParameter>(6);
+        addParameterToList(colors, "profile_background_color"
+                , profileBackgroundColor);
+        addParameterToList(colors, "profile_text_color"
+                , profileTextColor);
+        addParameterToList(colors, "profile_link_color"
+                , profileLinkColor);
+        addParameterToList(colors, "profile_sidebar_fill_color"
+                , profileSidebarFillColor);
+        addParameterToList(colors, "profile_sidebar_border_color"
+                , profileSidebarBorderColor);
+        return factory.createUser(post(conf.getRestBaseURL() +
+                        "account/update_profile_colors.json",
+                colors.toArray(new HttpParameter[colors.size()])
+        ));
     }
 
     private void addParameterToList(List<HttpParameter> colors,
